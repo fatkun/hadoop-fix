@@ -1,0 +1,583 @@
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/AppContext.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/AppContext.java
+index 075f3f5..adc03ee 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/AppContext.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/AppContext.java
+@@ -56,4 +56,7 @@ public interface AppContext {
+   Clock getClock();
+   
+   ClusterInfo getClusterInfo();
++
++	boolean isLastAMRetry();
++  
+ }
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+index 51415ee..7827090 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+@@ -63,6 +63,7 @@ import org.apache.hadoop.mapreduce.v2.api.records.TaskType;
+ import org.apache.hadoop.mapreduce.v2.app.client.ClientService;
+ import org.apache.hadoop.mapreduce.v2.app.client.MRClientService;
+ import org.apache.hadoop.mapreduce.v2.app.job.Job;
++import org.apache.hadoop.mapreduce.v2.app.job.JobStateInternal;
+ import org.apache.hadoop.mapreduce.v2.app.job.Task;
+ import org.apache.hadoop.mapreduce.v2.app.job.TaskAttempt;
+ import org.apache.hadoop.mapreduce.v2.app.job.event.JobEvent;
+@@ -437,8 +438,14 @@ public class MRAppMaster extends CompositeService {
+     }
+ 
+     try {
+-      //We are finishing cleanly so this is the last retry
+-      isLastAMRetry = true;
++      //if isLastAMRetry comes as true, should never set it to false
++      if ( !isLastAMRetry){
++        if (((JobImpl)job).getInternalState() != JobStateInternal.REBOOT) {
++          LOG.info("We are finishing cleanly so this is the last retry");
++          isLastAMRetry = true;
++        }
++      }
++      notifyIsLastAMRetry(isLastAMRetry);
+       // Stop all services
+       // This will also send the final report to the ResourceManager
+       LOG.info("Calling stop for all the services");
+@@ -827,6 +834,10 @@ public class MRAppMaster extends CompositeService {
+     public ClusterInfo getClusterInfo() {
+       return this.clusterInfo;
+     }
++    
++    public boolean isLastAMRetry() {
++    	return isLastAMRetry;
++    }
+   }
+ 
+   @SuppressWarnings("unchecked")
+@@ -1115,18 +1126,24 @@ public class MRAppMaster extends CompositeService {
+       if(appMaster.containerAllocator instanceof ContainerAllocatorRouter) {
+         ((ContainerAllocatorRouter) appMaster.containerAllocator)
+         .setSignalled(true);
+-        ((ContainerAllocatorRouter) appMaster.containerAllocator)
+-        .setShouldUnregister(appMaster.isLastAMRetry);
+-      }
+-      
+-      if(appMaster.jobHistoryEventHandler != null) {
+-        appMaster.jobHistoryEventHandler
+-          .setForcejobCompletion(appMaster.isLastAMRetry);
+       }
++      appMaster.notifyIsLastAMRetry(appMaster.isLastAMRetry);
+       appMaster.stop();
+     }
+   }
+ 
++  public void notifyIsLastAMRetry(boolean isLastAMRetry){
++    if(containerAllocator instanceof ContainerAllocatorRouter) {
++      LOG.info("Notify RMCommunicator isAMLastRetry: " + isLastAMRetry);
++      ((ContainerAllocatorRouter) containerAllocator)
++        .setShouldUnregister(isLastAMRetry);
++    }
++    if(jobHistoryEventHandler != null) {
++      LOG.info("Notify JHEH isAMLastRetry: " + isLastAMRetry);
++      jobHistoryEventHandler.setForcejobCompletion(isLastAMRetry);
++    }
++  }
++
+   protected static void initAndStartAppMaster(final MRAppMaster appMaster,
+       final YarnConfiguration conf, String jobUserName) throws IOException,
+       InterruptedException {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/JobStateInternal.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/JobStateInternal.java
+index 4767830..215a575 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/JobStateInternal.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/JobStateInternal.java
+@@ -26,5 +26,6 @@ public enum JobStateInternal {
+   FAILED,
+   KILL_WAIT,
+   KILLED,
+-  ERROR
++  ERROR,
++  REBOOT
+ }
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/event/JobEventType.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/event/JobEventType.java
+index 5accb6d..90fec3b 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/event/JobEventType.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/event/JobEventType.java
+@@ -47,6 +47,7 @@ public enum JobEventType {
+   JOB_TASK_ATTEMPT_FETCH_FAILURE,
+   
+   //Producer:RMContainerAllocator
+-  JOB_UPDATED_NODES
++  JOB_UPDATED_NODES,
++  JOB_AM_REBOOT
+   
+ }
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/JobImpl.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/JobImpl.java
+index e4000a6..2983aa0 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/JobImpl.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/JobImpl.java
+@@ -204,6 +204,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+       DIAGNOSTIC_UPDATE_TRANSITION = new DiagnosticsUpdateTransition();
+   private static final InternalErrorTransition
+       INTERNAL_ERROR_TRANSITION = new InternalErrorTransition();
++  private static final InternalRebootTransition
++      INTERNAL_REBOOT_TRANSITION = new InternalRebootTransition();
+   private static final TaskAttemptCompletedEventTransition
+       TASK_ATTEMPT_COMPLETED_EVENT_TRANSITION =
+           new TaskAttemptCompletedEventTransition();
+@@ -235,6 +237,9 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+           .addTransition(JobStateInternal.NEW, JobStateInternal.ERROR,
+               JobEventType.INTERNAL_ERROR,
+               INTERNAL_ERROR_TRANSITION)
++          .addTransition(JobStateInternal.NEW, JobStateInternal.REBOOT, 
++          		JobEventType.JOB_AM_REBOOT,
++          		INTERNAL_REBOOT_TRANSITION)
+           // Ignore-able events
+           .addTransition(JobStateInternal.NEW, JobStateInternal.NEW,
+               JobEventType.JOB_UPDATED_NODES)
+@@ -254,6 +259,9 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+           .addTransition(JobStateInternal.INITED, JobStateInternal.ERROR,
+               JobEventType.INTERNAL_ERROR,
+               INTERNAL_ERROR_TRANSITION)
++          .addTransition(JobStateInternal.INITED, JobStateInternal.REBOOT,
++              JobEventType.JOB_AM_REBOOT,
++              INTERNAL_REBOOT_TRANSITION)
+           // Ignore-able events
+           .addTransition(JobStateInternal.INITED, JobStateInternal.INITED,
+               JobEventType.JOB_UPDATED_NODES)
+@@ -292,6 +300,9 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+               JobStateInternal.RUNNING,
+               JobStateInternal.ERROR, JobEventType.INTERNAL_ERROR,
+               INTERNAL_ERROR_TRANSITION)
++          .addTransition(JobStateInternal.RUNNING, JobStateInternal.REBOOT, 
++          		JobEventType.JOB_AM_REBOOT,
++          		INTERNAL_REBOOT_TRANSITION)
+ 
+           // Transitions from KILL_WAIT state.
+           .addTransition
+@@ -316,7 +327,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+               EnumSet.of(JobEventType.JOB_KILL,
+                   JobEventType.JOB_UPDATED_NODES,
+                   JobEventType.JOB_MAP_TASK_RESCHEDULED,
+-                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE))
++                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE,
++                  JobEventType.JOB_AM_REBOOT))
+ 
+           // Transitions from SUCCEEDED state
+           .addTransition(JobStateInternal.SUCCEEDED, JobStateInternal.SUCCEEDED,
+@@ -332,7 +344,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+           .addTransition(JobStateInternal.SUCCEEDED, JobStateInternal.SUCCEEDED,
+               EnumSet.of(JobEventType.JOB_KILL, 
+                   JobEventType.JOB_UPDATED_NODES,
+-                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE))
++                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE,
++                  JobEventType.JOB_AM_REBOOT))
+ 
+           // Transitions from FAILED state
+           .addTransition(JobStateInternal.FAILED, JobStateInternal.FAILED,
+@@ -351,7 +364,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+                   JobEventType.JOB_TASK_COMPLETED,
+                   JobEventType.JOB_TASK_ATTEMPT_COMPLETED,
+                   JobEventType.JOB_MAP_TASK_RESCHEDULED,
+-                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE))
++                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE,
++                  JobEventType.JOB_AM_REBOOT))
+ 
+           // Transitions from KILLED state
+           .addTransition(JobStateInternal.KILLED, JobStateInternal.KILLED,
+@@ -367,7 +381,8 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+           .addTransition(JobStateInternal.KILLED, JobStateInternal.KILLED,
+               EnumSet.of(JobEventType.JOB_KILL, 
+                   JobEventType.JOB_UPDATED_NODES,
+-                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE))
++                  JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE,
++                  JobEventType.JOB_AM_REBOOT))
+ 
+           // No transitions from INTERNAL_ERROR state. Ignore all.
+           .addTransition(
+@@ -381,10 +396,30 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+                   JobEventType.JOB_DIAGNOSTIC_UPDATE,
+                   JobEventType.JOB_UPDATED_NODES,
+                   JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE,
+-                  JobEventType.INTERNAL_ERROR))
++                  JobEventType.INTERNAL_ERROR,
++                  JobEventType.JOB_AM_REBOOT))
+           .addTransition(JobStateInternal.ERROR, JobStateInternal.ERROR,
+               JobEventType.JOB_COUNTER_UPDATE, COUNTER_UPDATE_TRANSITION)
+           // create the topology tables
++          
++          // No transitions from AM_REBOOT state. Ignore all.
++          .addTransition(
++          		JobStateInternal.REBOOT, 
++          		JobStateInternal.REBOOT, 
++          		EnumSet.of(JobEventType.JOB_KILL,
++          				JobEventType.JOB_INIT,
++          				JobEventType.JOB_START,
++          				JobEventType.JOB_TASK_COMPLETED,
++          				JobEventType.JOB_MAP_TASK_RESCHEDULED,
++          				JobEventType.JOB_TASK_ATTEMPT_COMPLETED,
++          				JobEventType.JOB_COMPLETED,
++          				JobEventType.JOB_DIAGNOSTIC_UPDATE,
++          				JobEventType.INTERNAL_ERROR,
++          				JobEventType.JOB_TASK_ATTEMPT_FETCH_FAILURE,
++          				JobEventType.JOB_UPDATED_NODES,
++          				JobEventType.JOB_AM_REBOOT))
++          .addTransition(JobStateInternal.REBOOT, JobStateInternal.REBOOT, 
++          		JobEventType.JOB_COUNTER_UPDATE, COUNTER_UPDATE_TRANSITION)
+           .installTopology();
+  
+   private final StateMachine<JobStateInternal, JobEventType, JobEvent> stateMachine;
+@@ -750,9 +785,17 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+     }
+   }
+   
+-  private static JobState getExternalState(JobStateInternal smState) {
++  private JobState getExternalState(JobStateInternal smState) {
+     if (smState == JobStateInternal.KILL_WAIT) {
+       return JobState.KILLED;
++    } else if (smState == JobStateInternal.REBOOT) {
++    	if (appContext.isLastAMRetry()) {
++    		return JobState.ERROR;
++    	} else {
++    		// In case of not last retry, return the external state as RUNNING since
++    		// otherwise JobClient will exit when it polls the AM for job state
++    		return JobState.RUNNING;
++    	}
+     } else {
+       return JobState.valueOf(smState.name());
+     }
+@@ -828,6 +871,7 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+       case KILLED:
+         metrics.killedJob(this);
+         break;
++      case REBOOT:
+       case ERROR:
+       case FAILED:
+         metrics.failedJob(this);
+@@ -1609,8 +1653,17 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+     }
+   }
+   
+-  private static class InternalErrorTransition implements
++  private static class InternalTerminationTransition implements
+       SingleArcTransition<JobImpl, JobEvent> {
++  	JobStateInternal terminationState = null;
++  	String jobHistoryString = null;
++    public InternalTerminationTransition(JobStateInternal stateInternal,
++        String jobHistoryString) {
++      this.terminationState = stateInternal;
++      //mostly a hack for jbhistoryserver
++      this.jobHistoryString = jobHistoryString;
++    }
++  	
+     @Override
+     public void transition(JobImpl job, JobEvent event) {
+       //TODO Is this JH event required.
+@@ -1618,9 +1671,21 @@ public class JobImpl implements org.apache.hadoop.mapreduce.v2.app.job.Job,
+       JobUnsuccessfulCompletionEvent failedEvent =
+           new JobUnsuccessfulCompletionEvent(job.oldJobId,
+               job.finishTime, 0, 0,
+-              JobStateInternal.ERROR.toString());
++              jobHistoryString);
+       job.eventHandler.handle(new JobHistoryEvent(job.jobId, failedEvent));
+-      job.finished(JobStateInternal.ERROR);
++      job.finished(terminationState);
++    }
++  }
++  
++  private static class InternalErrorTransition extends InternalTerminationTransition {
++    public InternalErrorTransition() {
++      super(JobStateInternal.ERROR, JobStateInternal.ERROR.toString());
++    }
++  }
++
++  private static class InternalRebootTransition extends InternalTerminationTransition {
++    public InternalRebootTransition() {
++      super(JobStateInternal.REBOOT, JobStateInternal.ERROR.toString());
+     }
+   }
+ 
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+index a3299d2..75eff09 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+@@ -125,7 +125,7 @@ public class LocalContainerAllocator extends RMCommunicator
+       // This can happen if the RM has been restarted. If it is in that state,
+       // this application must clean itself up.
+       eventHandler.handle(new JobEvent(this.getJob().getID(),
+-                                       JobEventType.INTERNAL_ERROR));
++                                       JobEventType.JOB_AM_REBOOT));
+       throw new YarnException("Resource Manager doesn't recognize AttemptId: " +
+                                this.getContext().getApplicationID());
+     }
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+index 8ff4e37..2301786 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+@@ -575,7 +575,7 @@ public class RMContainerAllocator extends RMContainerRequestor
+       // This can happen if the RM has been restarted. If it is in that state,
+       // this application must clean itself up.
+       eventHandler.handle(new JobEvent(this.getJob().getID(),
+-                                       JobEventType.INTERNAL_ERROR));
++                                       JobEventType.JOB_AM_REBOOT));
+       throw new YarnException("Resource Manager doesn't recognize AttemptId: " +
+                                this.getContext().getApplicationID());
+     }
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRuntimeEstimators.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRuntimeEstimators.java
+index be897fa..e02b735 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRuntimeEstimators.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRuntimeEstimators.java
+@@ -848,5 +848,10 @@ public class TestRuntimeEstimators {
+     public ClusterInfo getClusterInfo() {
+       return new ClusterInfo();
+     }
++
++    @Override
++    public boolean isLastAMRetry() {
++      return false;
++    }
+   }
+ }
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestStagingCleanup.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestStagingCleanup.java
+index eee29a7..ac20703 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestStagingCleanup.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestStagingCleanup.java
+@@ -33,11 +33,14 @@ import junit.framework.TestCase;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.mapreduce.JobID;
+ import org.apache.hadoop.mapreduce.MRJobConfig;
++import org.apache.hadoop.mapreduce.TypeConverter;
+ import org.apache.hadoop.mapreduce.v2.api.records.JobId;
+ import org.apache.hadoop.mapreduce.v2.api.records.JobState;
+ import org.apache.hadoop.mapreduce.v2.app.client.ClientService;
+ import org.apache.hadoop.mapreduce.v2.app.job.Job;
++import org.apache.hadoop.mapreduce.v2.app.job.JobStateInternal;
+ import org.apache.hadoop.mapreduce.v2.app.job.event.JobFinishEvent;
+ import org.apache.hadoop.mapreduce.v2.app.job.impl.JobImpl;
+ import org.apache.hadoop.mapreduce.v2.app.rm.ContainerAllocator;
+@@ -69,6 +72,7 @@ import org.junit.Test;
+    @Test
+    public void testDeletionofStaging() throws IOException {
+      conf.set(MRJobConfig.MAPREDUCE_JOB_DIR, stagingJobDir);
++     conf.setInt(YarnConfiguration.RM_AM_MAX_RETRIES, 0);
+      fs = mock(FileSystem.class);
+      when(fs.delete(any(Path.class), anyBoolean())).thenReturn(true);
+      ApplicationAttemptId attemptId = recordFactory.newRecordInstance(
+@@ -80,9 +84,56 @@ import org.junit.Test;
+      attemptId.setApplicationId(appId);
+      JobId jobid = recordFactory.newRecordInstance(JobId.class);
+      jobid.setAppId(appId);
+-     MRAppMaster appMaster = new TestMRApp(attemptId);
++     ContainerAllocator mockAlloc = mock(ContainerAllocator.class);
++     MRAppMaster appMaster = new TestMRApp(attemptId, mockAlloc);
+      appMaster.init(conf);
+      appMaster.shutDownJob();
++     Assert.assertEquals(true, ((TestMRApp)appMaster).getTestIsLastAMRetry());
++     verify(fs).delete(stagingJobPath, true);
++   }
++   
++   @Test
++   public void testNoDeletionofStagingOnReboot() throws IOException {
++     conf.set(MRJobConfig.MAPREDUCE_JOB_DIR, stagingJobDir);
++     conf.setInt(YarnConfiguration.RM_AM_MAX_RETRIES, 1);
++     fs = mock(FileSystem.class);
++     when(fs.delete(any(Path.class), anyBoolean())).thenReturn(true);
++     ApplicationAttemptId attemptId = recordFactory.newRecordInstance(
++         ApplicationAttemptId.class);
++     attemptId.setAttemptId(0);
++     ApplicationId appId = recordFactory.newRecordInstance(ApplicationId.class);
++     appId.setClusterTimestamp(System.currentTimeMillis());
++     appId.setId(0);
++     attemptId.setApplicationId(appId);
++     JobId jobid = recordFactory.newRecordInstance(JobId.class);
++     jobid.setAppId(appId);
++     ContainerAllocator mockAlloc = mock(ContainerAllocator.class);
++     MRAppMaster appMaster = new TestMRApp(attemptId, mockAlloc, JobStateInternal.REBOOT);
++     appMaster.init(conf);
++     appMaster.shutDownJob();
++     Assert.assertEquals(false, ((TestMRApp)appMaster).getTestIsLastAMRetry());
++     verify(fs, times(0)).delete(stagingJobPath, true);
++   }
++   
++   @Test
++   public void testDeletionofStagingOnReboot() throws IOException {
++     conf.set(MRJobConfig.MAPREDUCE_JOB_DIR, stagingJobDir);
++     fs = mock(FileSystem.class);
++     when(fs.delete(any(Path.class), anyBoolean())).thenReturn(true);
++     ApplicationAttemptId attemptId = recordFactory.newRecordInstance(
++         ApplicationAttemptId.class);
++     attemptId.setAttemptId(1);
++     ApplicationId appId = recordFactory.newRecordInstance(ApplicationId.class);
++     appId.setClusterTimestamp(System.currentTimeMillis());
++     appId.setId(0);
++     attemptId.setApplicationId(appId);
++     JobId jobid = recordFactory.newRecordInstance(JobId.class);
++     jobid.setAppId(appId);
++     ContainerAllocator mockAlloc = mock(ContainerAllocator.class);
++     MRAppMaster appMaster = new TestMRApp(attemptId, mockAlloc, JobStateInternal.REBOOT);
++     appMaster.init(conf);
++     appMaster.shutDownJob();
++     Assert.assertEquals(true, ((TestMRApp)appMaster).getTestIsLastAMRetry());
+      verify(fs).delete(stagingJobPath, true);
+    }
+    
+@@ -128,6 +179,7 @@ import org.junit.Test;
+      jobid.setAppId(appId);
+      ContainerAllocator mockAlloc = mock(ContainerAllocator.class);
+      MRAppMaster appMaster = new TestMRApp(attemptId, mockAlloc);
++     conf.setInt(YarnConfiguration.RM_AM_MAX_RETRIES, YarnConfiguration.DEFAULT_RM_AM_MAX_RETRIES);
+      appMaster.init(conf);
+      //simulate the process being killed
+      MRAppMaster.MRAppMasterShutdownHook hook = 
+@@ -138,6 +190,8 @@ import org.junit.Test;
+ 
+    private class TestMRApp extends MRAppMaster {
+      ContainerAllocator allocator;
++		 private boolean testIsLastAMRetry = false;
++		 JobStateInternal jobStateInternal;
+ 
+      public TestMRApp(ApplicationAttemptId applicationAttemptId, 
+          ContainerAllocator allocator) {
+@@ -150,6 +204,32 @@ import org.junit.Test;
+      public TestMRApp(ApplicationAttemptId applicationAttemptId) {
+        this(applicationAttemptId, null);
+      }
++     
++     public TestMRApp(ApplicationAttemptId applicationAttemptId,
++    		 ContainerAllocator allocator, JobStateInternal jobStateInternal) {
++    	 this(applicationAttemptId, allocator);
++    	 this.jobStateInternal = jobStateInternal;
++     }
++     
++     @Override
++     protected Job createJob(Configuration conf) {
++       JobImpl jobImpl = mock(JobImpl.class);
++       if (this.jobStateInternal != null) {
++      	 when(jobImpl.getInternalState()).thenReturn(this.jobStateInternal);
++       }
++       JobID jobID = JobID.forName("job_1234567890000_0001");
++       JobId jobId = TypeConverter.toYarn(jobID);
++       when(jobImpl.getID()).thenReturn(jobId);
++       ((AppContext) getContext())
++           .getAllJobs().put(jobImpl.getID(), jobImpl);
++       return jobImpl;
++     }
++     
++     @Override
++     public void notifyIsLastAMRetry(boolean isLastAMRetry){
++    	 setTestIsLastAMRetry(isLastAMRetry);
++    	 super.notifyIsLastAMRetry(isLastAMRetry);
++     }
+ 
+      @Override
+      protected FileSystem getFileSystem(Configuration conf) {
+@@ -177,6 +257,14 @@ import org.junit.Test;
+      @Override
+      protected void downloadTokensAndSetupUGI(Configuration conf) {
+      }
++
++		public boolean getTestIsLastAMRetry() {
++			return testIsLastAMRetry;
++		}
++
++		public void setTestIsLastAMRetry(boolean testIsLastAMRetry) {
++			this.testIsLastAMRetry = testIsLastAMRetry;
++		}
+    }
+ 
+   private final class MRAppTestCleanup extends MRApp {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebApp.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebApp.java
+index 8ef7e68..1cf0b5c 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebApp.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebApp.java
+@@ -113,6 +113,11 @@ public class TestAMWebApp {
+     public ClusterInfo getClusterInfo() {
+       return null;
+     }
++
++    @Override
++    public boolean isLastAMRetry() {
++      return false;
++    }
+   }
+ 
+   @Test public void testAppControllerIndex() {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServices.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServices.java
+index 59a6fa6..28e0b28 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServices.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServices.java
+@@ -141,6 +141,10 @@ public class TestAMWebServices extends JerseyTest {
+     public ClusterInfo getClusterInfo() {
+       return null;
+     }
++    @Override
++    public boolean isLastAMRetry() {
++      return false;
++    }
+   }
+ 
+   private Injector injector = Guice.createInjector(new ServletModule() {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesAttempts.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesAttempts.java
+index d3d1419..2cf9c7b 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesAttempts.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesAttempts.java
+@@ -151,6 +151,11 @@ public class TestAMWebServicesAttempts extends JerseyTest {
+     public ClusterInfo getClusterInfo() {
+       return null;
+     }
++
++    @Override
++    public boolean isLastAMRetry() {
++      return false;
++    }
+   }
+ 
+   private Injector injector = Guice.createInjector(new ServletModule() {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesJobConf.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesJobConf.java
+index 2e9abe7..2ba162a 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesJobConf.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesJobConf.java
+@@ -152,6 +152,11 @@ public class TestAMWebServicesJobConf extends JerseyTest {
+     public ClusterInfo getClusterInfo() {
+       return null;
+     }
++
++    @Override
++    public boolean isLastAMRetry() {
++      return false;
++    }
+   }
+ 
+   private Injector injector = Guice.createInjector(new ServletModule() {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesJobs.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesJobs.java
+index 25186a6..84d3219 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesJobs.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesJobs.java
+@@ -154,6 +154,10 @@ public class TestAMWebServicesJobs extends JerseyTest {
+     public ClusterInfo getClusterInfo() {
+       return null;
+     }
++    @Override
++    public boolean isLastAMRetry() {
++      return false;
++    }
+   }
+ 
+   private Injector injector = Guice.createInjector(new ServletModule() {
+diff --git a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesTasks.java b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesTasks.java
+index ea3abda..1702c75 100644
+--- a/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesTasks.java
++++ b/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/webapp/TestAMWebServicesTasks.java
+@@ -148,6 +148,11 @@ public class TestAMWebServicesTasks extends JerseyTest {
+     public ClusterInfo getClusterInfo() {
+       return null;
+     }
++
++    @Override
++    public boolean isLastAMRetry() {
++      return false;
++    }
+   }
+ 
+   private Injector injector = Guice.createInjector(new ServletModule() {
+diff --git a/hadoop-yarn-project/.pom.xml.swp b/hadoop-yarn-project/.pom.xml.swp
+deleted file mode 100644
+index 0979756..0000000
+Binary files a/hadoop-yarn-project/.pom.xml.swp and /dev/null differ
