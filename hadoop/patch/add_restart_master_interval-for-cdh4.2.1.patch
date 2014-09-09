@@ -1,0 +1,60 @@
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+index faa50aa..37a4188 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+@@ -176,6 +176,11 @@ public class YarnConfiguration extends Configuration {
+   public static final String RM_AM_MAX_RETRIES = 
+     RM_PREFIX + "am.max-retries";
+   public static final int DEFAULT_RM_AM_MAX_RETRIES = 1;
++
++  /** How long to wait before restart AM. */
++  public static final String RM_AM_RETRY_INTERVAL_MS =
++      RM_PREFIX + "am.retry-interval-ms";
++  public static final int DEFAULT_RM_AM_RETRY_INTERVAL_MS = 2 * 60 * 1000;
+   
+   /** The keytab for the resource manager.*/
+   public static final String RM_KEYTAB = 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java
+index 0317a3c..99a9d1a 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmapp/RMAppImpl.java
+@@ -85,6 +85,7 @@ public class RMAppImpl implements RMApp {
+   private final ApplicationMasterService masterService;
+   private final StringBuilder diagnostics = new StringBuilder();
+   private final int maxRetries;
++  private final int retryInterval;
+   private final ReadLock readLock;
+   private final WriteLock writeLock;
+   private final Map<ApplicationAttemptId, RMAppAttempt> attempts
+@@ -231,6 +232,8 @@ public class RMAppImpl implements RMApp {
+ 
+     this.maxRetries = conf.getInt(YarnConfiguration.RM_AM_MAX_RETRIES,
+         YarnConfiguration.DEFAULT_RM_AM_MAX_RETRIES);
++    this.retryInterval = conf.getInt(YarnConfiguration.RM_AM_RETRY_INTERVAL_MS, 
++        YarnConfiguration.DEFAULT_RM_AM_RETRY_INTERVAL_MS);
+ 
+     ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+     this.readLock = lock.readLock();
+@@ -655,7 +658,21 @@ public class RMAppImpl implements RMApp {
+       }
+ 
+       if (retryApp) {
+-        app.createNewAttempt();
++        final RMAppImpl finalApp = app;
++        new Thread(new Runnable() {
++          @Override
++          public void run() {
++            try {
++              LOG.info("retryApp sleep");
++              // sleep some time allow nodemanger local dir check
++              Thread.sleep(finalApp.retryInterval);
++            } catch (InterruptedException e) {
++              LOG.error("retryApp sleep Interrupted");
++            }
++            finalApp.createNewAttempt();
++          }
++        }).start();
++
+         return initialState;
+       } else {
+         LOG.info(msg);
