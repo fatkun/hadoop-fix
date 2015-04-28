@@ -577,7 +577,3 @@ index ea3abda..1702c75 100644
    }
  
    private Injector injector = Guice.createInjector(new ServletModule() {
-diff --git a/hadoop-yarn-project/.pom.xml.swp b/hadoop-yarn-project/.pom.xml.swp
-deleted file mode 100644
-index 0979756..0000000
-Binary files a/hadoop-yarn-project/.pom.xml.swp and /dev/null differ
