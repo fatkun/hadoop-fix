@@ -477,4 +477,3 @@ index 6813165..bcb88ec 100644
 +                                     reduceTask.getShuffleSecret());
        fetchers[i].start();
      }
-     
