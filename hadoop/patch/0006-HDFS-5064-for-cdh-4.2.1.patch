@@ -1,0 +1,268 @@
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+index 12c6547..6485530 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+@@ -1205,7 +1205,11 @@ public class FSImage implements Closeable {
+     this.lastAppliedTxId = editLog.getLastWrittenTxId();
+   }
+ 
+-  public synchronized long getMostRecentCheckpointTxId() {
++  // Should be OK for this to not be synchronized since all of the places which
++  // mutate this value are themselves synchronized so it shouldn't be possible
++  // to see this flop back and forth. In the worst case this will just return an
++  // old value.
++  public long getMostRecentCheckpointTxId() {
+     return storage.getMostRecentCheckpointTxId();
+   }
+ }
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+index 68ddfb0..6a37c11 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -99,6 +99,7 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.ReentrantLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import javax.management.NotCompliantMBeanException;
+@@ -346,6 +347,23 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+   private ReentrantReadWriteLock fsLock = new ReentrantReadWriteLock(true);
+ 
+   /**
++   * When locking the FSNS for a read that may take a long time, we take this
++   * lock before taking the regular FSNS read lock. All writers also take this
++   * lock before taking the FSNS write lock. Regular (short) readers do not
++   * take this lock at all, instead relying solely on the synchronization of the
++   * regular FSNS lock.
++   * 
++   * This scheme ensures that:
++   * 1) In the case of normal (fast) ops, readers proceed concurrently and
++   *    writers are not starved.
++   * 2) In the case of long read ops, short reads are allowed to proceed
++   *    concurrently during the duration of the long read.
++   * 
++   * See HDFS-5064 for more context.
++   */
++  private ReentrantLock fsLongReadLock = new ReentrantLock(true);
++
++  /**
+    * Used when this NN is in standby state to read from the shared edit log.
+    */
+   private EditLogTailer editLogTailer = null;
+@@ -950,20 +968,47 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+     this.fsLock.readLock().lock();
+   }
+   @Override
++  public void longReadLockInterruptibly() throws InterruptedException {
++    this.fsLongReadLock.lockInterruptibly();
++    try {
++      this.fsLock.readLock().lockInterruptibly();
++    } catch (InterruptedException ie) {
++      // In the event we're interrupted while getting the normal FSNS read lock,
++      // release the long read lock.
++      this.fsLongReadLock.unlock();
++      throw ie;
++    }
++  }
++  @Override
++  public void longReadUnlock() {
++    this.fsLock.readLock().unlock();
++    this.fsLongReadLock.unlock();
++  }
++  @Override
+   public void readUnlock() {
+     this.fsLock.readLock().unlock();
+   }
+   @Override
+   public void writeLock() {
++    this.fsLongReadLock.lock();
+     this.fsLock.writeLock().lock();
+   }
+   @Override
+   public void writeLockInterruptibly() throws InterruptedException {
+-    this.fsLock.writeLock().lockInterruptibly();
++    this.fsLongReadLock.lockInterruptibly();
++    try {
++      this.fsLock.writeLock().lockInterruptibly();
++    } catch (InterruptedException ie) {
++      // In the event we're interrupted while getting the normal FSNS write
++      // lock, release the long read lock.
++      this.fsLongReadLock.unlock();
++      throw ie;
++    }
+   }
+   @Override
+   public void writeUnlock() {
+     this.fsLock.writeLock().unlock();
++    this.fsLongReadLock.unlock();
+   }
+   @Override
+   public boolean hasWriteLock() {
+@@ -5681,9 +5726,14 @@ public class FSNamesystem implements Namesystem, FSClusterStats,
+   }
+   
+   @VisibleForTesting
+-  ReentrantReadWriteLock getFsLockForTests() {
++  public ReentrantReadWriteLock getFsLockForTests() {
+     return fsLock;
+   }
++  
++  @VisibleForTesting
++  public ReentrantLock getLongReadLockForTests() {
++    return fsLongReadLock;
++  }
+ 
+   @VisibleForTesting
+   public SafeModeInfo getSafeModeInfoForTests() {
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
+index a760a21..42b9ca0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
+@@ -128,7 +128,7 @@ public class NNStorage extends Storage implements Closeable,
+    * recent fsimage file. This does not include any transactions
+    * that have since been written to the edit log.
+    */
+-  protected long mostRecentCheckpointTxId = HdfsConstants.INVALID_TXID;
++  protected volatile long mostRecentCheckpointTxId = HdfsConstants.INVALID_TXID;
+   
+   /**
+    * Time of the last checkpoint, in milliseconds since the epoch.
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+index a97e55d..c0f61f9 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+@@ -144,7 +144,7 @@ public class StandbyCheckpointer {
+     assert canceler != null;
+     long txid;
+     
+-    namesystem.writeLockInterruptibly();
++    namesystem.longReadLockInterruptibly();
+     try {
+       assert namesystem.getEditLog().isOpenForRead() :
+         "Standby Checkpointer should only attempt a checkpoint when " +
+@@ -167,7 +167,7 @@ public class StandbyCheckpointer {
+       assert txid == thisCheckpointTxId : "expected to save checkpoint at txid=" +
+         thisCheckpointTxId + " but instead saved at txid=" + txid;
+     } finally {
+-      namesystem.writeUnlock();
++      namesystem.longReadUnlock();
+     }
+     
+     // Upload the saved checkpoint back to the active
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/RwLock.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/RwLock.java
+index 8a0f992..a2d9295 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/RwLock.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/RwLock.java
+@@ -21,6 +21,15 @@ package org.apache.hadoop.hdfs.util;
+ public interface RwLock {
+   /** Acquire read lock. */
+   public void readLock();
++  
++  /**
++   * Acquire the long read lock, unless interrupted while waiting. The long
++   * read lock should also serve to block all concurrent writers.
++   **/
++  void longReadLockInterruptibly() throws InterruptedException;
++  
++  /** Release the long read lock. */
++  public void longReadUnlock();
+ 
+   /** Release read lock. */
+   public void readUnlock();
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+index 0475068..19307f7 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+@@ -18,6 +18,7 @@
+ package org.apache.hadoop.hdfs.server.namenode.ha;
+ 
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+@@ -25,6 +26,7 @@ import java.io.File;
+ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.net.URI;
++import java.net.URL;
+ import java.util.List;
+ 
+ import org.apache.commons.logging.Log;
+@@ -33,6 +35,7 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.hdfs.DFSTestUtil;
+ import org.apache.hadoop.hdfs.MiniDFSCluster;
+ import org.apache.hadoop.hdfs.MiniDFSNNTopology;
+ import org.apache.hadoop.hdfs.server.namenode.FSImage;
+@@ -281,6 +284,66 @@ public class TestStandbyCheckpoints {
+     assertTrue("SBN should have finished checkpointing.",
+         answerer.getFireCount() == 1 && answerer.getResultCount() == 1);
+   }
++  
++  @Test(timeout=300000)
++  public void testReadsAllowedDuringCheckpoint() throws Exception {
++    
++    // Set it up so that we know when the SBN checkpoint starts and ends.
++    FSImage spyImage1 = NameNodeAdapter.spyOnFsImage(nn1);
++    DelayAnswer answerer = new DelayAnswer(LOG);
++    Mockito.doAnswer(answerer).when(spyImage1)
++        .saveNamespace(Mockito.any(FSNamesystem.class),
++            Mockito.any(Canceler.class));
++    
++    // Perform some edits and wait for a checkpoint to start on the SBN.
++    doEdits(0, 1000);
++    nn0.getRpcServer().rollEditLog();
++    answerer.waitForCall();
++    answerer.proceed();
++    assertTrue("SBN is not performing checkpoint but it should be.",
++        answerer.getFireCount() == 1 && answerer.getResultCount() == 0);
++    
++    // Make sure that the lock has actually been taken by the checkpointing
++    // thread.
++    ThreadUtil.sleepAtLeastIgnoreInterrupts(1000);
++    
++    // Perform an RPC that needs to take the write lock.
++    Thread t = new Thread() {
++      @Override
++      public void run() {
++        try {
++          nn1.getRpcServer().restoreFailedStorage("false");
++        } catch (IOException e) {
++          e.printStackTrace();
++        }
++      }
++    };
++    t.start();
++    
++    // Make sure that our thread is waiting for the lock.
++    ThreadUtil.sleepAtLeastIgnoreInterrupts(1000);
++    
++    assertFalse(nn1.getNamesystem().getFsLockForTests().hasQueuedThreads());
++    assertFalse(nn1.getNamesystem().getFsLockForTests().isWriteLocked());
++    assertTrue(nn1.getNamesystem().getLongReadLockForTests().hasQueuedThreads());
++    
++    // Get /jmx of the standby NN web UI, which will cause the FSNS read lock to
++    // be taken.
++    String pageContents = DFSTestUtil.urlGet(new URL("http://" +
++        nn1.getHttpAddress().getHostName() + ":" +
++        nn1.getHttpAddress().getPort() + "/jmx"));
++    assertTrue(pageContents.contains("NumLiveDataNodes"));
++    
++    // Make sure that the checkpoint is still going on, implying that the client
++    // RPC to the SBN happened during the checkpoint.
++    assertTrue("SBN should have still been checkpointing.",
++        answerer.getFireCount() == 1 && answerer.getResultCount() == 0);
++    answerer.waitForResult();
++    assertTrue("SBN should have finished checkpointing.",
++        answerer.getFireCount() == 1 && answerer.getResultCount() == 1);
++    
++    t.join();
++  }
+ 
+   private void doEdits(int start, int stop) throws IOException {
+     for (int i = start; i < stop; i++) {
